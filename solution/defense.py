@@ -3,8 +3,14 @@ Online fault detector for the Data Siege stream.
 
 Cost funnel per event: payload metadata + ctx.baseline + ctx.state are free,
 then exactly one metered tool call (tools return exact values, so repeating a
-call never adds information). Each handler combines single-dimension bound
-checks with a pillar-specific composite/statistical check.
+call never adds information). Each handler layers three checks:
+  1. fixed bounds from ctx.baseline / calibrated separation thresholds,
+  2. a robust z-score (median/MAD) against that signal's own clean history,
+     learned online in ctx.state, which catches subtle faults that still sit
+     inside the static bounds,
+  3. for data batches, a composite distance across all profile dimensions.
+Only events that raised no alert feed the clean history, so faults don't
+widen the reference distribution.
 """
 import math
 
@@ -20,10 +26,21 @@ REQUIRED_UPSTREAM = {"dbt:stg_orders": {"raw.orders", "raw.customers"}}
 FEATURE_SHIFT_SIGMA_THRESHOLD = 0.65   # clean <= ~0.47, skew >= ~0.97
 EMBEDDING_SHIFT_THRESHOLD = 0.0395     # clean < 0.039, drift > 0.040
 DOC_AGE_DAYS_THRESHOLD = 44.5          # clean < 41, stale >= 48
+
+# Online robust z-score: |x - median| / (1.4826 * MAD) over clean history.
+# A caught fault is worth ~4x what a false alarm costs under the scoring
+# formula (0.5/n_faulty vs 0.3/n_clean with ~1:3 faulty:clean), so this sits
+# just below the point where practice stays at zero false positives (5.0),
+# not at it.
+ROBUST_Z = 4.5
+ROBUST_WARMUP = 10
+HISTORY_MAX = 200
+
 # Composite batch check: sum of squared z-scores (~chi-square, <=5 dof on
 # clean data); 20.5 is the 5-dof p=0.001 point.
 BATCH_CHI2_THRESHOLD = 20.5
-BATCH_WARMUP = 8
+
+UPPER, LOWER, BOTH = "upper", "lower", "both"
 
 
 def register(ctx):
@@ -38,16 +55,89 @@ def _ok(result):
     return isinstance(result, dict) and "error" not in result
 
 
-def _verdict(pillar, reasons):
+def _mu_sigma(lo, hi):
+    """Baselines are mean +/- 3 sigma, so recover (mean, sigma) from the band."""
+    return (lo + hi) / 2.0, (hi - lo) / 6.0
+
+
+# ---------------------------------------------------------------- online stats
+
+def _history(ctx, key):
+    return ctx.state.setdefault("history", {}).setdefault(key, [])
+
+
+def _robust_center_scale(hist):
+    """(median, robust sigma) of the clean history, or None during warmup."""
+    if len(hist) < ROBUST_WARMUP:
+        return None
+    s = sorted(hist)
+    med = _median(s)
+    mad = _median(sorted(abs(v - med) for v in s))
+    sigma = 1.4826 * mad
+    # Guard against a degenerate (near-constant) history blowing z up.
+    floor = max(abs(med) * 1e-3, 1e-9)
+    return med, max(sigma, floor)
+
+
+def _median(sorted_vals):
+    n = len(sorted_vals)
+    mid = n // 2
+    return sorted_vals[mid] if n % 2 else (sorted_vals[mid - 1] + sorted_vals[mid]) / 2.0
+
+
+def _directional(z, direction):
+    """Only deviations in the faulty direction count."""
+    if direction == UPPER:
+        return max(z, 0.0)
+    if direction == LOWER:
+        return max(-z, 0.0)
+    return abs(z)
+
+
+class _Signals:
+    """Collects one event's signals, scores them against clean history, and
+    commits them to history only if the event ends up not alerting."""
+
+    def __init__(self, ctx, prefix):
+        self.ctx = ctx
+        self.prefix = prefix
+        self.values = {}
+        self.z = {}
+
+    def add(self, name, x, direction, prior=None):
+        if x is None:
+            return None
+        hist = _history(self.ctx, f"{self.prefix}.{name}")
+        cs = _robust_center_scale(hist) or prior
+        self.values[name] = x
+        if cs is None or cs[1] <= 0:
+            return None
+        z = _directional((x - cs[0]) / cs[1], direction)
+        self.z[name] = z
+        return z
+
+    def outliers(self, threshold=ROBUST_Z):
+        return [f"{n} robust z={z:.1f} (value {self.values[n]:.4g})"
+                for n, z in self.z.items() if z > threshold]
+
+    def commit(self, reasons):
+        if reasons:
+            return
+        for name, x in self.values.items():
+            hist = _history(self.ctx, f"{self.prefix}.{name}")
+            hist.append(x)
+            if len(hist) > HISTORY_MAX:
+                del hist[0]
+
+
+def _finish(pillar, sig, reasons):
+    sig.commit(reasons)
     if reasons:
         return Verdict(alert=True, pillar=pillar, reason="; ".join(reasons))
     return Verdict(alert=False, pillar=pillar)
 
 
-def _mu_sigma(lo, hi):
-    """Baselines are mean +/- 3 sigma, so recover (mean, sigma) from the band."""
-    return (lo + hi) / 2.0, (hi - lo) / 6.0
-
+# -------------------------------------------------------------------- handlers
 
 def check_data_batch(payload, ctx):
     pillar = "checks"
@@ -70,51 +160,25 @@ def check_data_batch(payload, ctx):
     if stale > b["staleness_min_max"]:
         reasons.append(f"staleness {stale:.2f}min > {b['staleness_min_max']}")
 
+    # Rows/mean are scored against the baseline band until enough clean
+    # history exists; std/null/stale have no published centre and join once
+    # learned online.
+    sig = _Signals(ctx, "batch")
+    sig.add("rows", rows, BOTH, prior=_mu_sigma(b["row_count_min"], b["row_count_max"]))
+    sig.add("mean", mean, BOTH, prior=_mu_sigma(b["mean_amount_min"], b["mean_amount_max"]))
+    sig.add("std", prof["std_amount"], BOTH)
+    sig.add("null", null, UPPER)
+    sig.add("stale", stale, UPPER)
+
+    if not reasons:
+        reasons += sig.outliers()
     # Composite distance catches batches drifting on several dims at once
-    # while each one stays inside its own 3-sigma band. Every dim is centred
-    # on its clean mean (learned online, seeded from the baseline band where
-    # one exists) so a normal batch scores ~sqrt(n_dims), not something
-    # inflated by uncentred null/staleness terms.
-    stats = ctx.state.setdefault("batch_stats", {})
-    vec = {"rows": rows, "mean": mean, "std": prof["std_amount"], "null": null, "stale": stale}
-    if not reasons:
-        d2, n = _composite_d2(stats, vec, b)
-        if d2 is not None and d2 > BATCH_CHI2_THRESHOLD:
-            reasons.append(f"composite distance^2 {d2:.1f} over {n} dims > {BATCH_CHI2_THRESHOLD}")
-    if not reasons:
-        for k, x in vec.items():
-            _welford_add(stats.setdefault(k, [0, 0.0, 0.0]), x)
-    return _verdict(pillar, reasons)
-
-
-def _welford_add(acc, x):
-    acc[0] += 1
-    delta = x - acc[1]
-    acc[1] += delta / acc[0]
-    acc[2] += delta * (x - acc[1])
-
-
-def _composite_d2(stats, vec, b):
-    """Sum of squared z-scores across dims with a usable clean estimate.
-    Rows/mean fall back to the baseline band until enough clean batches have
-    been seen; std/null/stale have no published centre, so they join only
-    once learned online."""
-    prior = {"rows": _mu_sigma(b["row_count_min"], b["row_count_max"]),
-             "mean": _mu_sigma(b["mean_amount_min"], b["mean_amount_max"])}
-    d2, n = 0.0, 0
-    for k, x in vec.items():
-        acc = stats.get(k)
-        if acc and acc[0] >= BATCH_WARMUP:
-            mu, sd = acc[1], math.sqrt(acc[2] / (acc[0] - 1))
-        elif k in prior:
-            mu, sd = prior[k]
-        else:
-            continue
-        if sd <= 0:
-            continue
-        d2 += ((x - mu) / sd) ** 2
-        n += 1
-    return (d2, n) if n >= 2 else (None, n)
+    # while each one stays unremarkable on its own.
+    if not reasons and len(sig.z) >= 2:
+        d2 = sum(z * z for z in sig.z.values())
+        if d2 > BATCH_CHI2_THRESHOLD:
+            reasons.append(f"composite distance^2 {d2:.1f} over {len(sig.z)} dims > {BATCH_CHI2_THRESHOLD}")
+    return _finish(pillar, sig, reasons)
 
 
 def check_contract_checkpoint(payload, ctx):
@@ -130,7 +194,12 @@ def check_contract_checkpoint(payload, ctx):
             reasons.append(f"freshness {delay:.2f}min > declared SLA {sla}")
         elif delay > ctx.baseline["freshness_delay_max_min"]:
             reasons.append(f"freshness {delay:.2f}min > baseline {ctx.baseline['freshness_delay_max_min']}")
-    return _verdict(pillar, reasons)
+
+    sig = _Signals(ctx, f"contract.{payload.get('contract_id')}")
+    sig.add("freshness_delay", delay, UPPER)
+    if not reasons:
+        reasons += sig.outliers()
+    return _finish(pillar, sig, reasons)
 
 
 def check_lineage_run(payload, ctx):
@@ -154,7 +223,12 @@ def check_lineage_run(payload, ctx):
     dur = sl.get("duration_ms")
     if dur is not None and dur > ctx.baseline["lineage_duration_ms_max"]:
         reasons.append(f"runtime {dur}ms > {ctx.baseline['lineage_duration_ms_max']}")
-    return _verdict(pillar, reasons)
+
+    sig = _Signals(ctx, f"lineage.{payload.get('job')}")
+    sig.add("duration_ms", dur, UPPER)
+    if not reasons:
+        reasons += sig.outliers()
+    return _finish(pillar, sig, reasons)
 
 
 def check_feature_materialization(payload, ctx):
@@ -166,7 +240,17 @@ def check_feature_materialization(payload, ctx):
     reasons = []
     if shift > FEATURE_SHIFT_SIGMA_THRESHOLD:
         reasons.append(f"train/serve skew {shift:.3f} sigma > {FEATURE_SHIFT_SIGMA_THRESHOLD}")
-    return _verdict(pillar, reasons)
+
+    # Signed shift keeps the direction the tool's absolute value throws away,
+    # so a skew is judged against how far clean serving means actually wander.
+    signed = None
+    if fd.get("train_std"):
+        signed = (fd["serve_mean"] - fd["train_mean"]) / fd["train_std"]
+    sig = _Signals(ctx, f"feature.{payload.get('feature_view')}")
+    sig.add("signed_shift", signed, BOTH)
+    if not reasons:
+        reasons += sig.outliers()
+    return _finish(pillar, sig, reasons)
 
 
 def check_embedding_batch(payload, ctx):
@@ -179,4 +263,10 @@ def check_embedding_batch(payload, ctx):
         reasons.append(f"centroid shift {ed['centroid_shift']:.4f} > {EMBEDDING_SHIFT_THRESHOLD}")
     if ed["avg_doc_age_days"] > DOC_AGE_DAYS_THRESHOLD:
         reasons.append(f"avg doc age {ed['avg_doc_age_days']:.1f}d > {DOC_AGE_DAYS_THRESHOLD}")
-    return _verdict(pillar, reasons)
+
+    sig = _Signals(ctx, f"embedding.{payload.get('corpus')}")
+    sig.add("centroid_shift", ed["centroid_shift"], UPPER)
+    sig.add("avg_doc_age_days", ed["avg_doc_age_days"], UPPER)
+    if not reasons:
+        reasons += sig.outliers()
+    return _finish(pillar, sig, reasons)

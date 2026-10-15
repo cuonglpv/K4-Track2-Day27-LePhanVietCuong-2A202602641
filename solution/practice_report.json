@@ -3,11 +3,11 @@
     "n_faulty": 33,
     "n_clean": 87,
     "tpr": 1.0,
-    "fpr": 0.0,
+    "fpr": 0.0115,
     "cost_ledger": 180.0,
     "budget": 220.0,
     "cost_overage": 0.0,
-    "score": 50.0,
+    "score": 49.66,
     "phase": "practice",
     "defense_file": "solution/defense.py",
     "per_pillar_band": {
@@ -344,7 +344,7 @@
       },
       {
         "seq": 81,
-        "alert": false
+        "alert": true
       },
       {
         "seq": 82,
@@ -500,5 +500,5 @@
       }
     ]
   },
-  "signature": "594b57ded9357afb0a59116251c445d2a78eaf1a1c6a5a0f2672e42539a9ea8e"
+  "signature": "f0a7ea6e7283c6d2f60f26be62f783d600421cb4e5a132740a83922e136eb1fb"
 }
